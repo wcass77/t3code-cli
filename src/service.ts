@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { withT3Api, type T3Api } from "./api.js";
+import { fetchCatalog, resolveModelChange, type ProviderCatalog } from "./catalog.js";
 import { CliError } from "./errors.js";
 import { readLocalProjects } from "./localProjects.js";
 import { applyModelOverrides } from "./modelSelection.js";
@@ -246,6 +247,13 @@ function temporaryWorktreeBranch(): string {
 }
 
 async function projectsFromApi(api: T3Api): Promise<T3Project[]> {
+  if (api.runtime.orchestrationProtocolVersion === 2) {
+    const snapshot = await api.request("GET", "/api/projects") as { projects?: T3Project[] };
+    if (!Array.isArray(snapshot?.projects)) {
+      throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned a project snapshot without projects.");
+    }
+    return activeProjects(snapshot.projects);
+  }
   const shell = await api.shellSnapshot().catch(() => null);
   if (shell && Array.isArray(shell.projects)) return activeProjects(shell.projects);
   const snapshot = await api.snapshot();
@@ -253,6 +261,14 @@ async function projectsFromApi(api: T3Api): Promise<T3Project[]> {
     throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned a snapshot without projects.");
   }
   return activeProjects(snapshot.projects);
+}
+
+function catalogDefault(catalog: ProviderCatalog): ModelSelection {
+  const available = catalog.providers.filter((provider) => provider.enabled && provider.models.length > 0);
+  const provider = available.find((candidate) => candidate.instanceId === "codex") ?? available[0];
+  if (!provider) throw new CliError("T3_CATALOG_UNAVAILABLE", "T3 has no enabled provider with advertised models.");
+  const model = provider.models.find((candidate) => candidate.isDefault) ?? provider.models[0]!;
+  return { instanceId: provider.instanceId, model: model.slug };
 }
 
 function projectTitle(workspaceRoot: string): string {
@@ -403,7 +419,9 @@ export async function ensureProject(config: CliConfig, options: WorkspaceOptions
       workspace,
       options.projectPolicy ?? config.projectPolicy,
       options.dryRun ?? false,
-      defaultModelSelectionForVersion(runtime.serverVersion),
+      runtime.orchestrationProtocolVersion === 2
+        ? catalogDefault(await fetchCatalog(api))
+        : defaultModelSelectionForVersion(runtime.serverVersion),
     )),
   }));
 }
@@ -718,13 +736,15 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
   const installedDefaultModelSelection = defaultModelSelectionForVersion(runtime.serverVersion);
 
   const result = await withT3Api(runtime, config, async (api, invocation) => {
+    const catalog = runtime.orchestrationProtocolVersion === 2 ? await fetchCatalog(api) : null;
+    const defaultSelection = catalog ? catalogDefault(catalog) : installedDefaultModelSelection;
     const projectResult = await ensureProjectWithApi(
       api,
       localProjects,
       workspace,
       options.projectPolicy ?? config.projectPolicy,
       true,
-      installedDefaultModelSelection,
+      defaultSelection,
     );
     // A handover from a linked worktree of the project's checkout keeps working in that worktree.
     const currentWorktreePath = pathsEqual(projectResult.project.workspaceRoot, workspace.workspaceRoot)
@@ -758,14 +778,62 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
     }
     const createdAt = new Date().toISOString();
     const threadId = randomUUID();
-    const modelSelection = resolveModelSelection(
-      projectResult.project.defaultModelSelection ?? installedDefaultModelSelection,
-      config,
-      options,
-    );
+    const baseSelection = projectResult.project.defaultModelSelection ?? defaultSelection;
+    const modelSelection = catalog
+      ? resolveModelChange(baseSelection, {
+          provider: options.provider ?? config.provider,
+          model: options.model ?? config.model,
+          speedMode: options.speedMode ?? config.speedMode,
+          thinkingEffort: options.thinkingEffort ?? config.thinkingEffort,
+        }, catalog)
+      : resolveModelSelection(baseSelection, config, options);
     const title = threadTitle(prompt);
     const runtimeMode = options.runtimeMode ?? config.runtimeMode;
     const interactionMode = options.interactionMode ?? config.interactionMode;
+    if (catalog) {
+      // One server-owned launch binds the workspace before the initial run.
+      // Never execute the old create/start/bootstrap payloads on V2.
+      const workspaceStrategy = envMode === "worktree"
+        ? { type: "worktree", baseRef: workspace.branch!, startFromOrigin: settings.newWorktreesStartFromOrigin }
+        : currentWorktreePath
+          ? { type: "existing_worktree", worktreePath: currentWorktreePath,
+              ...(workspace.branch ? { branch: workspace.branch } : {}) }
+          : { type: "root", ...(workspace.branch ? { branch: workspace.branch } : {}) };
+      const command = {
+        commandId: randomUUID(), threadId, projectId: projectResult.project.id,
+        title, modelSelection, runtimeMode, interactionMode, workspaceStrategy,
+        initialMessage: { messageId: randomUUID(), text: prompt, attachments: [] },
+      };
+      const projectDispatch = projectResult.created && !options.dryRun
+        ? await api.dispatch(projectResult.command) : null;
+      let dispatch: unknown = null;
+      if (!options.dryRun) {
+        try {
+          dispatch = await api.rpc("orchestration.launchThread", command, 10 * 60_000);
+          if ((dispatch as { threadId?: unknown } | null)?.threadId !== threadId) {
+            throw new CliError("T3_INVALID_RESPONSE", "T3 did not return the requested launch thread id.");
+          }
+        } catch (cause) {
+          // Launch can have committed before a connection failed. Deleting or
+          // retrying here could destroy accepted work or create duplicates.
+          throw new CliError("THREAD_START_FAILED", "T3 could not confirm the V2 handover. Inspect this thread before retrying.",
+            { cause, details: { threadId, commandId: command.commandId, cleanup: "server-managed" } });
+        }
+      }
+      const projection = (dispatch as { projection?: { runs?: Array<{ id: string; status: string }> } } | null)?.projection;
+      const run = projection?.runs?.at(-1);
+      return {
+        runtime, auth: { source: invocation.source, version: invocation.version }, workspace,
+        settings: { ...settings,
+          projectDefaultThreadEnvMode: asEffectiveThreadEnvMode(projectResult.project.defaultThreadEnvMode),
+          projectFileDefaultThreadEnvMode: projectFile.defaultThreadEnvMode,
+          effectiveThreadEnvMode: envMode, threadEnvModeSource: envModeResolution.source },
+        project: projectResult.project, projectCreated: projectResult.created,
+        projectCommand: projectResult.command, projectDispatch,
+        thread: { id: threadId, title, createCommand: null, createDispatch: null,
+          command, dispatch, rpc: "orchestration.launchThread", runId: run?.id ?? null, status: run?.status ?? null },
+      };
+    }
     const projectDispatch = projectResult.created && !options.dryRun
       ? await api.dispatch(projectResult.command)
       : projectResult.dispatch;

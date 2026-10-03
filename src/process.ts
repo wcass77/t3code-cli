@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CliError } from "./errors.js";
+import type { T3Runtime } from "./types.js";
 
 export interface ProcessResult {
   stdout: string;
@@ -86,7 +87,7 @@ export async function commandExists(command: string): Promise<boolean> {
 export interface T3Invocation {
   command: string;
   argsPrefix: string[];
-  source: "configured" | "bundled" | "path" | "npx";
+  source: "configured" | "runtime" | "bundled" | "path" | "npx";
   version: string | null;
 }
 
@@ -119,11 +120,36 @@ async function bundledT3Invocation(): Promise<T3Invocation | null> {
   return null;
 }
 
-export async function resolveT3Invocation(configured?: readonly string[]): Promise<T3Invocation> {
+export async function resolveT3Invocation(
+  configured?: readonly string[],
+  local?: { runtime: T3Runtime; t3Home: string },
+): Promise<T3Invocation> {
   if (configured && configured.length > 0) {
     const [command, ...argsPrefix] = configured;
     if (!command) throw new CliError("INVALID_T3_COMMAND", "Configured t3Command is empty.");
     return { command, argsPrefix, source: "configured", version: null };
+  }
+
+  if (local && (local.runtime.orchestrationProtocolVersion ?? 1) === 2) {
+    const version = local.runtime.serverVersion;
+    if (/^\d+\.\d+\.\d+[\w.-]*$/u.test(version)) {
+      const executable = path.join(local.t3Home, "runtime", "versions", version,
+        process.platform === "win32" ? "t3.exe" : "t3");
+      if (await isFile(executable)) {
+        return { command: executable, argsPrefix: [], source: "runtime", version };
+      }
+    }
+    // A V1 auth CLI writes credentials into the preserved V1 database.
+    // Do not silently issue a credential that the V2 server cannot see.
+    if (await commandExists("t3")) {
+      const result = await runProcess("t3", ["--version"], { timeoutMs: 5_000, allowFailure: true });
+      if (result.exitCode === 0 && result.stdout.trim().split(/\s+/u).includes(version)) {
+        return { command: "t3", argsPrefix: [], source: "path", version };
+      }
+    }
+    throw new CliError("T3_AUTH_CLI_INCOMPATIBLE",
+      "No matching V2 T3 executable was found. Set t3Command (or T3CODE_CLI_T3_COMMAND) to this server's upstream CLI.",
+      { details: { serverVersion: version } });
   }
 
   const bundled = await bundledT3Invocation();

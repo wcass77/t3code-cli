@@ -40,6 +40,7 @@ export interface T3Runtime {
   settingsPath: string | null;
   environmentId: string;
   serverVersion: string;
+  orchestrationProtocolVersion?: number;
   capabilities: {
     threadSettlement?: boolean;
     [key: string]: unknown;

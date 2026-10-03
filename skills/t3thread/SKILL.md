@@ -5,7 +5,10 @@ description: Work with an existing T3 Code thread by its id. Summarize it, answe
 
 # T3 thread
 
-The user writes `$t3thread <thread-id> <instruction>`. The instruction is optional. This skill uses the `t3code` CLI; see the `use-t3code-cli` skill for setup and handovers.
+The user writes `$t3thread <thread-id> <instruction>`. The instruction is optional.
+On V2, discover capabilities and use T3's native thread list/read/send/wait and
+control tools, inspecting the exact ID before writes. The CLI commands below
+apply to V1; they fail explicitly on V2. See `use-t3code-cli` for initial handovers.
 
 ## 1. Resolve the target
 

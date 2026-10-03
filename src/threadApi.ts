@@ -304,6 +304,10 @@ export class T3ThreadApi {
     private readonly api: T3Api,
     options: T3ThreadApiOptions = {},
   ) {
+    if (api.runtime?.orchestrationProtocolVersion === 2) {
+      throw new CliError("T3_LEGACY_COMMAND_UNSUPPORTED",
+        "Existing-thread CLI commands target V1. On V2, use T3's native thread tools after handover.");
+    }
     this.verificationTimeoutMs = options.verificationTimeoutMs ?? DEFAULT_VERIFICATION_TIMEOUT_MS;
     this.verificationIntervalMs = options.verificationIntervalMs ?? DEFAULT_VERIFICATION_INTERVAL_MS;
     this.waitIntervalMs = options.waitIntervalMs ?? DEFAULT_WAIT_INTERVAL_MS;

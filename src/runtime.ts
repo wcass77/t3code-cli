@@ -10,6 +10,7 @@ import type { CliConfig, RuntimeState, T3Runtime } from "./types.js";
 interface EnvironmentDescriptor {
   environmentId: string;
   serverVersion: string;
+  orchestrationProtocolVersion?: number;
   capabilities: {
     threadSettlement?: boolean;
     [key: string]: unknown;
@@ -53,7 +54,14 @@ async function fetchDescriptor(origin: string): Promise<EnvironmentDescriptor | 
       !Array.isArray(value.capabilities)
         ? value.capabilities
         : {};
-    return { environmentId: value.environmentId, serverVersion: value.serverVersion, capabilities };
+    return {
+      environmentId: value.environmentId,
+      serverVersion: value.serverVersion,
+      capabilities,
+      ...(typeof value.orchestrationProtocolVersion === "number"
+        ? { orchestrationProtocolVersion: value.orchestrationProtocolVersion }
+        : {}),
+    };
   } catch {
     return null;
   }

@@ -6,6 +6,24 @@ It connects to the running local T3 server. For a handover, it resolves the work
 
 ## Install
 
+### Orchestrator V2 (Willy's fork)
+
+This fork supports the installed V2 nightly for `doctor`, project discovery,
+`models list`, and `handover` / `threads create`. V2 handover sends one
+`orchestration.launchThread` WebSocket RPC with the model, workspace strategy,
+and initial message. It reads current projects through `/api/projects`, avoiding
+the preserved V1 projection database. Authentication uses the running nightly's
+own `t3 auth session` executable and revokes the temporary session in `finally`.
+
+Use the CLI to trigger the initial conversation from a timer or another external
+process. Once inside T3, use its native thread, delegation, and scheduling tools.
+The existing-thread CLI commands documented below still target V1 and return an
+explicit unsupported error on V2. The JSON envelope remains backward compatible;
+V2 handover adds `thread.rpc`, `thread.runId`, and `thread.status`.
+
+Use this checkout's built command for V2; the published upstream package has not
+yet adopted this launch contract. Run `pnpm check` to update the linked command.
+
 Requirements: T3 Code and Node.js 22.16+ on the 22 line, 23.11+ on the 23 line, or 24.10+.
 
 ```bash
@@ -96,7 +114,7 @@ t3code handover \
 | `--mode`, `--interaction-mode` | `build`/`default`, `plan` |
 | `--checkout`, `--env-mode` | `current`/`local`, `worktree`, or T3's configured default via `t3` |
 
-Command flags override the CLI config, which overrides the T3 project's saved model selection. Without either override, the saved selection and its options are passed through unchanged. A newly-created project uses the detected T3 version's default (`gpt-5.4` on 0.0.28 and `gpt-5.6-sol` on 0.0.29 and later).
+Command flags override the CLI config, which overrides the T3 project's saved model selection. Without either override, the saved selection and its options are passed through unchanged. On V2, a newly-created project uses the live provider catalog's advertised default model. V1 retains its version-based defaults.
 
 Speed and thinking effort are stored as model options. T3 applies the option ids supported by the selected provider/model. If `--provider` changes the project's default provider instance, also pass `--model` because provider instance ids can be user-defined and do not imply a model.
 
@@ -126,6 +144,9 @@ t3code models list --provider codex
 `models list` shows T3's configured provider instances, their models, and model options such as reasoning effort. Human-readable output summarizes providers with more than 40 models. Use `--provider <instance-id>` to select one provider instance and expand its full model list. Disabled providers show only their status in human-readable output. JSON includes the full catalog for the selected providers.
 
 ## Existing threads
+
+These commands require Orchestrator V1. On V2, use T3's built-in thread tools
+after the initial CLI handover.
 
 List threads across projects, or restrict discovery by project id or workspace:
 

@@ -163,7 +163,9 @@ export class T3Api {
   constructor(
     readonly runtime: T3Runtime,
     private readonly token: string,
-  ) {}
+  ) {
+    assertSupportedProtocol(runtime);
+  }
 
   async request(method: "GET" | "POST", requestPath: string, payload?: unknown): Promise<unknown> {
     const url = new URL(requestPath, this.runtime.origin);
@@ -176,6 +178,8 @@ export class T3Api {
         method,
         headers: {
           authorization: `Bearer ${this.token}`,
+          ...(this.runtime.orchestrationProtocolVersion === 2
+            ? { "x-t3-orchestration-protocol": "2" } : {}),
           ...(payload === undefined ? {} : { "content-type": "application/json" }),
         },
         signal: AbortSignal.timeout(30_000),
@@ -201,10 +205,16 @@ export class T3Api {
         details: { status, body },
       });
     }
+    if (typeof body === "string" && url.pathname.startsWith("/api/")) {
+      throw new CliError("T3_INVALID_RESPONSE", `T3 returned non-JSON content for ${method} ${url.pathname}.`);
+    }
     return body;
   }
 
   async snapshot(): Promise<OrchestrationSnapshot> {
+    if (this.runtime.orchestrationProtocolVersion === 2) {
+      throw new CliError("T3_LEGACY_COMMAND_UNSUPPORTED", "V2 has no legacy full snapshot. Use the native T3 thread tools.");
+    }
     return (await this.request("GET", "/api/orchestration/snapshot")) as OrchestrationSnapshot;
   }
 
@@ -213,6 +223,13 @@ export class T3Api {
   }
 
   async dispatch(command: unknown): Promise<unknown> {
+    if (this.runtime.orchestrationProtocolVersion === 2) {
+      const type = (command as { type?: unknown } | null)?.type;
+      if (typeof type === "string" && type.startsWith("project.")) {
+        return await this.request("POST", "/api/projects/mutate", command);
+      }
+      throw new CliError("T3_LEGACY_COMMAND_UNSUPPORTED", "Use handover to launch a V2 thread, then use the native T3 thread tools.");
+    }
     return await this.request("POST", "/api/orchestration/dispatch", command);
   }
 
@@ -234,6 +251,9 @@ export class T3Api {
     const url = new URL("/ws", this.runtime.origin);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("wsTicket", issued.ticket);
+    if (this.runtime.orchestrationProtocolVersion === 2) {
+      url.searchParams.set("orchestrationProtocol", "2");
+    }
     return await rpcRequest(url, tag, payload, timeoutMs);
   }
 }
@@ -243,11 +263,20 @@ export async function withT3Api<T>(
   config: CliConfig,
   run: (api: T3Api, invocation: T3Invocation) => Promise<T>,
 ): Promise<T> {
-  const invocation = await resolveT3Invocation(config.t3Command);
+  assertSupportedProtocol(runtime);
+  const invocation = await resolveT3Invocation(config.t3Command, { runtime, t3Home: resolveT3Home(config) });
   const session = await issueSession(invocation, config);
   try {
     return await run(new T3Api(runtime, session.token), invocation);
   } finally {
     await revokeSession(invocation, config, session.sessionId);
+  }
+}
+
+export function assertSupportedProtocol(runtime: T3Runtime): void {
+  const protocol = runtime.orchestrationProtocolVersion ?? 1;
+  if (protocol !== 1 && protocol !== 2) {
+    throw new CliError("T3_PROTOCOL_UNSUPPORTED", `T3 orchestration protocol ${protocol} is unsupported. Update t3code-cli.`,
+      { details: { orchestrationProtocolVersion: protocol } });
   }
 }

@@ -26,6 +26,8 @@ function parseJson<T>(raw: string | null, fallback: T): T {
 }
 
 export function readLocalProjects(runtime: T3Runtime): T3Project[] | null {
+  // V2 preserves state.sqlite as an import source. It is not live state.
+  if ((runtime.orchestrationProtocolVersion ?? 1) !== 1) return null;
   if (!runtime.stateDir) return null;
   const dbPath = path.join(runtime.stateDir, "state.sqlite");
   let database: DatabaseSync | null = null;

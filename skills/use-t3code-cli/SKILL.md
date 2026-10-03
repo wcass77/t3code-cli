@@ -7,6 +7,13 @@ description: Operate the t3code CLI to resolve folders or Git repositories into 
 
 Use `t3code` as the supported interface. Do not read T3 credentials or construct bearer tokens directly.
 
+On Orchestrator V2, use this CLI for an external trigger's initial handover,
+project discovery, model catalog, and diagnostics. After handover, use T3's
+built-in tools for thread operations, delegation, and scheduling. Existing-thread
+CLI commands below require V1 and fail explicitly on V2. Discover live tools and
+models with `orchestrator_capabilities`; retain native launch IDs and reconcile
+the thread list before retrying a launch with a lost response.
+
 ## Verify readiness
 
 Run:
@@ -45,7 +52,7 @@ $handoverPrompt | t3code --json handover --stdin
 
 `--cwd` defaults to the process's current working directory. Select thread controls when needed with `--provider`, `--model`, `--speed`, `--thinking-effort`, `--permission`, `--mode build|plan`, and `--checkout current|worktree`.
 
-Unless command flags or CLI config explicitly override it, a new thread inherits the T3 project's complete saved model selection, including provider-specific options. For a missing project, the CLI uses the detected T3 version's default model (`gpt-5.4` on 0.0.28 and `gpt-5.6-sol` on 0.0.29 and later).
+Unless command flags or CLI config explicitly override it, a new thread inherits the T3 project's complete saved model selection, including provider-specific options. For a missing V2 project, it uses the live catalog's advertised default model. V1 retains version-based defaults.
 
 The permission default is full access (`full-access`). The CLI sends it on the new thread, the first turn, and the atomic worktree bootstrap. An explicit `--permission` or `runtimeMode` CLI setting remains authoritative.
 
