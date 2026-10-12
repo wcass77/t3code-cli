@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,7 +9,7 @@ import { afterEach, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "./config.js";
 import { doctor } from "./doctor.js";
 import { createHandoverThread, listProjects } from "./service.js";
-import { resolveT3Invocation, runProcess } from "./process.js";
+import { runProcess } from "./process.js";
 import type { CliConfig, T3Project } from "./types.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -26,6 +26,7 @@ async function harness(options: { protocol?: number; rejectAuth?: boolean; failL
   const actionsPath = path.join(root, "auth-actions.jsonl");
   const mockT3 = path.join(root, "auth.mjs");
   await writeFile(mockT3, `import { appendFileSync } from 'node:fs';
+if(process.argv.includes('--version')){process.stdout.write(${JSON.stringify(version)});process.exit(0);}
 const action=process.argv.includes('issue')?'issue':'revoke';
 appendFileSync(${JSON.stringify(actionsPath)},JSON.stringify(action)+'\\n');
 if(action==='issue')process.stdout.write(JSON.stringify({sessionId:'fixture-session',token:'fixture-token'}));\n`);
@@ -118,7 +119,7 @@ test("V2 handover uses live projects/catalog and one protocol-2 launch; auth is 
   const result = await createHandoverThread(h.config, { cwd: h.root, prompt: "Prompt with $(literal) and `literal`",
     thinkingEffort: "medium", speedMode: "fast", openMode: "none" });
   expect(result.project.id).toBe("live-project");
-  expect(result.thread).toMatchObject({ rpc: "orchestration.launchThread", runId: "run-1", status: "preparing" });
+  expect(result.thread.launch.threadId).toBe(result.thread.id);
   const launch = h.rpcCalls.find(x => x.tag === "orchestration.launchThread")!;
   expect(launch.payload).toMatchObject({ threadId: result.thread.id, projectId: "live-project", runtimeMode: "full-access",
     interactionMode: "default", workspaceStrategy: { type: "root", branch: "main" },
@@ -133,7 +134,7 @@ test("V2 handover uses live projects/catalog and one protocol-2 launch; auth is 
 test("V2 dry-run validates catalog but writes no project, thread, or worktree", async () => {
   const h = await harness({ missingProject: true });
   const result = await createHandoverThread(h.config, { cwd: h.root, prompt: "Plan", threadEnvMode: "worktree", dryRun: true });
-  expect(result.thread.command).toMatchObject({ workspaceStrategy: { type: "worktree", baseRef: "main", startFromOrigin: true } });
+  expect(result.thread.launch).toMatchObject({ workspaceStrategy: { type: "worktree", baseRef: "main", startFromOrigin: true } });
   expect(h.rpcCalls.map(x => x.tag)).toEqual(["server.getConfig"]);
   expect(h.projects).toHaveLength(0);
   expect(h.httpPaths).not.toContain("/api/projects/mutate");
@@ -154,28 +155,34 @@ test("V2 linked worktree launch binds the existing checkout", async () => {
   const worktree = path.join(h.root, "linked");
   await runProcess("git", ["worktree", "add", "-b", "existing", worktree], { cwd: h.root });
   const result = await createHandoverThread(h.config, { cwd: worktree, prompt: "Keep checkout", openMode: "none" });
-  expect(result.thread.command).toMatchObject({ workspaceStrategy: { type: "existing_worktree", worktreePath: worktree, branch: "existing" } });
+  expect(result.thread.launch).toMatchObject({ workspaceStrategy: { type: "existing_worktree", worktreePath: worktree, branch: "existing" } });
 });
 
 test("V2 failed launch reports identifiers for reconciliation and revokes auth without deletion or retry", async () => {
   const h = await harness({ failLaunch: true });
   await expect(createHandoverThread(h.config, { cwd: h.root, prompt: "Start", openMode: "none" }))
-    .rejects.toMatchObject({ code: "THREAD_START_FAILED", details: { threadId: expect.any(String), commandId: expect.any(String) } });
+    .rejects.toMatchObject({ code: "THREAD_START_FAILED", details: { threadId: expect.any(String), launchCommandId: expect.any(String), cleanup: "server-managed" } });
   expect(h.rpcCalls.map(x => x.tag)).toEqual(["server.getConfig", "orchestration.launchThread"]);
   expect(await h.actions()).toEqual(["issue", "revoke"]);
 });
 
-test("V2 doctor reports rejected authentication and revokes the credential", async () => {
+test("V2 project authentication rejection still revokes the issued credential", async () => {
   const h = await harness({ rejectAuth: true });
-  const result = await doctor(h.config, "fixture-config", false);
-  expect(result.ok).toBe(false);
-  expect(result.checks.authentication).toMatchObject({ ok: false, errorCode: "T3_API_ERROR" });
+  await expect(listProjects(h.config)).rejects.toMatchObject({ code: "T3_API_ERROR" });
   expect(await h.actions()).toEqual(["issue", "revoke"]);
+});
+
+test("maintenance doctor's version field remains available without issuing auth", async () => {
+  const h = await harness();
+  const result = await doctor(h.config, "fixture-config", false);
+  expect(result.checks.t3Server).toMatchObject({ ok: true, version });
+  expect(result.checks.orchestrationProtocol).toMatchObject({ ok: true, server: 2 });
+  expect(await h.actions()).toEqual([]);
 });
 
 test("V2 discovery rejects an app HTML fallback and still revokes authentication", async () => {
   const h = await harness({ htmlProjects: true });
-  await expect(listProjects(h.config)).rejects.toMatchObject({ code: "T3_INVALID_RESPONSE" });
+  await expect(listProjects(h.config)).rejects.toMatchObject({ code: "T3_INVALID_SNAPSHOT" });
   expect(await h.actions()).toEqual(["issue", "revoke"]);
 });
 
@@ -185,12 +192,17 @@ test("unknown orchestration protocols fail before any credential is issued", asy
   expect(await h.actions()).toEqual([]);
 });
 
-test("V2 auth discovery prefers its installed executable over the V1 bundled CLI", async () => {
+
+test("external note-review caller retains its handover settings and thread receipt field", async () => {
   const h = await harness();
-  const executable = path.join(h.home, "runtime", "versions", version, process.platform === "win32" ? "t3.exe" : "t3");
-  await mkdir(path.dirname(executable), { recursive: true }); await writeFile(executable, "fixture"); await chmod(executable, 0o755);
-  const invocation = await resolveT3Invocation(undefined, { t3Home: h.home, runtime: {
-    origin: h.config.origin!, environmentId: "env", serverVersion: version, orchestrationProtocolVersion: 2,
-    stateDir: path.join(h.home, "userdata"), runtimeStatePath: null, settingsPath: null, capabilities: {} } });
-  expect(invocation).toMatchObject({ command: executable, source: "runtime", version });
+  const config: CliConfig = { ...h.config, projectPolicy: "existing", workspaceMode: "repo",
+    openMode: "none", threadEnvMode: "local", runtimeMode: "full-access", interactionMode: "default",
+    provider: "codex", model: "live-model", speedMode: "standard", thinkingEffort: "medium", sessionTtl: "10m" };
+  const data = await createHandoverThread(config, { cwd: h.root, prompt: "Review pending notes" });
+  expect({ ok: true, data }).toMatchObject({ ok: true, data: { thread: { id: expect.any(String) } } });
+  expect(data.thread.launch).toMatchObject({ runtimeMode: "full-access", interactionMode: "default",
+    workspaceStrategy: { type: "root", branch: "main" },
+    modelSelection: { instanceId: "codex", model: "live-model", options: [
+      { id: "reasoningEffort", value: "medium" }, { id: "serviceTier", value: "default" }] } });
+  expect(data.opened.kind).toBe("none");
 });
